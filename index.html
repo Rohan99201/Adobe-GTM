@@ -29,7 +29,7 @@ window.adobeDataLayer.push({
 if (/[?&]mode=inline/.test(location.search)) {
   window.__bridgeSource = "hardcoded in page";
 /*
- * ACDL -> MSG "aa" bridge  v3.1.0   (One Digital / Markerstudy Group)
+ * ACDL -> MSG "aa" bridge  v3.2.0   (One Digital / Markerstudy Group)
  *
  * Source: window.adobeDataLayer, as specified in the Analytics Blueprint.
  * Target: window.dataLayer, in the exact shape of the MSG Global Analytics
@@ -45,7 +45,8 @@ if (/[?&]mode=inline/.test(location.search)) {
  *
  * Built to last:
  *  - Future ACDL events are never lost: unmapped ones reach GTM as aa_<name>,
- *    with their data under aa{}, following the MSG naming convention.
+ *    with their data flattened into single keys under aa{} (aa.hello, not
+ *    aa.rohantest.hello), so one GTM variable reads each value.
  *  - New mappings are a few lines in CUSTOM_RULES (or acdlBridge.addRule from
  *    another tag). The engine below never needs editing.
  *  - Privacy guard on EVERY push: PII keys dropped; emails, card numbers,
@@ -62,7 +63,7 @@ if (/[?&]mode=inline/.test(location.search)) {
  */
 (function (w) {
   "use strict";
-  var VERSION = "3.1.0";
+  var VERSION = "3.2.0";
   if (w.__acdlBridge) { return; }                 // run-once guard
   if (w.__acdlBridgeOff === true || /[?&]acdl_off=1/.test(w.location.search)) { return; }  // kill switch
 
@@ -114,6 +115,19 @@ if (/[?&]mode=inline/.test(location.search)) {
     aa_lookup: 1, aa_live_chat: 1, aa_begin_checkout: 1, aa_purchase: 1, acdl_bridge_health: 1
   };
   var COLLISION_PREFIX = "aa_acdl_";
+
+  // How unknown events are laid out under aa{}.
+  //  "full":      every value is one key.  {rohantest:{hello, nested:{level}}}
+  //               -> aa.hello, aa.nested_level
+  //  "one_level": only the outer wrapper is removed -> aa.hello, aa.nested.level
+  //  "off":       data kept exactly as sent         -> aa.rohantest.hello
+  // Two objects with the same key name (quote.status, payment.status) keep
+  // their wrapper name on that key (quote_status, payment_status).
+  // Lists of objects become one key per field, values joined with "|", plus
+  // a _count key: add_ons [{name:"a"},{name:"b"}] -> add_ons_name "a|b",
+  // add_ons_count 2. This matches MSG's own policy_name "x|y" convention.
+  var UNMAPPED_FLATTEN = "full";
+  var LIST_SEPARATORS = ["|", ",", ";"];   // outer list, list inside a list, deeper
 
   // Keys MSG owns inside aa{}. A new event carrying one of these (e.g. its own
   // "user" object) has it renamed to acdl_<key>, so it never mixes with or
@@ -176,7 +190,9 @@ if (/[?&]mode=inline/.test(location.search)) {
     maxDepth: 10,          // deeper nesting is dropped
     rememberIds: 500,      // how many event_ids are kept for de-duplication
     slowEventMs: 20,       // a single event slower than this is reported (typical: under 1ms)
-    healthEvents: 5        // max acdl_bridge_health pushes per page
+    healthEvents: 5,       // max acdl_bridge_health pushes per page
+    maxFlatKeys: 150,      // max keys an unknown event can add under aa{}
+    maxKeyLength: 60       // longer flattened key names are cut
   };
 
   // Keys whose text or number values are always dropped. Boolean values are
@@ -561,6 +577,42 @@ if (/[?&]mode=inline/.test(location.search)) {
     return gone;
   }
 
+  // GTM variable paths split on dots, so keys must be plain words.
+  function safeKey(k) { return String(k).replace(/[^A-Za-z0-9_]/g, "_"); }
+  function joinKey(a, b) { return a ? (b ? a + "_" + b : a) : b; }
+
+  // Writes every value of v into out as a single key. level = list depth.
+  function flatInto(out, prefix, v, level, deep) {
+    var k, i, objects = false;
+    if (v === null || v === undefined || typeof v === "function") { return; }
+    if (Array.isArray(v)) {
+      if (!v.length) { return; }
+      for (i = 0; i < v.length; i++) { if (v[i] && typeof v[i] === "object") { objects = true; } }
+      var sep = LIST_SEPARATORS[Math.min(level, LIST_SEPARATORS.length - 1)];
+      if (!objects) { out[prefix] = v.length === 1 ? v[0] : v.join(sep); return; }
+      out[joinKey(prefix, "count")] = v.length;
+      if (v.length === 1) { flatInto(out, prefix, v[0], level, deep); return; }
+      var cols = {}, order = [], one, arr;
+      for (i = 0; i < v.length; i++) {
+        one = {};
+        flatInto(one, "", v[i], level + 1, deep);
+        for (k in one) { if (one.hasOwnProperty(k)) { if (!cols[k]) { cols[k] = []; order.push(k); } cols[k][i] = one[k]; } }
+      }
+      for (var c = 0; c < order.length; c++) {
+        arr = [];
+        for (i = 0; i < v.length; i++) { arr.push(cols[order[c]][i] === undefined ? "" : String(cols[order[c]][i])); }
+        out[joinKey(prefix, order[c])] = arr.join(sep);
+      }
+      return;
+    }
+    if (typeof v === "object") {
+      if (!deep && prefix) { out[prefix] = v; return; }      // "one_level": keep inner objects
+      for (k in v) { if (v.hasOwnProperty(k)) { flatInto(out, joinKey(prefix, safeKey(k)), v[k], level, deep); } }
+      return;
+    }
+    out[prefix] = v;
+  }
+
   function buildUnmapped(name, d) {
     var base = name.indexOf("aa_") === 0 ? name.slice(3) : name;    // no aa_aa_ doubling
     var evt = UNMAPPED_PREFIX + base;
@@ -568,10 +620,39 @@ if (/[?&]mode=inline/.test(location.search)) {
       evt = COLLISION_PREFIX + base;
       health("name_collision", name, "sent as " + evt);
     }
-    var box = {}, k;
-    for (k in d) {
-      if (!d.hasOwnProperty(k) || k === "event_id") { continue; }      // event_id already sits at top level
-      box[MSG_AA_KEYS[k] ? "acdl_" + k : k] = d[k];
+    var box = {}, k, f, m, v, sk;
+
+    if (UNMAPPED_FLATTEN === "off") {
+      for (k in d) {
+        if (!d.hasOwnProperty(k) || k === "event_id") { continue; }
+        box[MSG_AA_KEYS[k] ? "acdl_" + k : safeKey(k)] = d[k];
+      }
+    } else {
+      var deep = UNMAPPED_FLATTEN === "full", entries = [], counts = {}, used = 0;
+      for (k in d) {
+        if (!d.hasOwnProperty(k) || k === "event_id") { continue; }  // event_id already sits at top level
+        v = d[k]; sk = safeKey(k); m = {};
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          // Plain object at the top: drop its wrapper name (rohantest.hello -> hello)
+          for (f in v) { if (v.hasOwnProperty(f)) { flatInto(m, safeKey(f), v[f], 0, deep); } }
+          for (f in m) { if (m.hasOwnProperty(f)) { entries.push({ short: f, full: sk + "_" + f, value: m[f] }); } }
+        } else {
+          // Lists and single values keep their own name (products -> products_name)
+          flatInto(m, sk, v, 0, deep);
+          for (f in m) { if (m.hasOwnProperty(f)) { entries.push({ short: f, full: f, value: m[f] }); } }
+        }
+      }
+      for (f = 0; f < entries.length; f++) { counts[entries[f].short] = (counts[entries[f].short] || 0) + 1; }
+      for (f = 0; f < entries.length; f++) {
+        var e = entries[f];
+        var key = (counts[e.short] > 1 || MSG_AA_KEYS[e.short]) ? e.full : e.short;
+        if (MSG_AA_KEYS[key]) { key = "acdl_" + key; }
+        key = key.slice(0, LIMITS.maxKeyLength);
+        var n = 2, unique = key;
+        while (box.hasOwnProperty(unique)) { unique = key + "_" + (n++); }
+        if (used >= LIMITS.maxFlatKeys) { health("too_many_keys", name, entries.length + " keys, kept " + LIMITS.maxFlatKeys); break; }
+        box[unique] = e.value; used++;
+      }
     }
     var out = { event: evt };
     out[UNMAPPED_CONTAINER] = box;
@@ -613,7 +694,7 @@ if (/[?&]mode=inline/.test(location.search)) {
       stats.received++;
 
       // Event names become GTM trigger names, so keep them clean and short.
-      name = lc(String(item.event || item.eventName)).replace(/[^a-z0-9_]/g, "_").slice(0, 40);
+      name = lc(String(item.event || item.eventName)).replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "unnamed";
       var d = (item.data && typeof item.data === "object") ? item.data
             : (item.eventInfo && typeof item.eventInfo === "object") ? item.eventInfo : {};
 
@@ -621,11 +702,13 @@ if (/[?&]mode=inline/.test(location.search)) {
       if (!allowRate()) { stats.rate_limited++; health("rate_limited", name, LIMITS.perSecond + "/s"); return; }
 
       remember(name, d);
-      var rule = EVENT_RULES[name], out;
+      var rule = EVENT_RULES[name], out, counter = { n: 0 };
       if (rule) {
         out = BUILDERS[rule](d, name); stats.mapped++;
       } else if (FORWARD_UNMAPPED) {
-        out = buildUnmapped(name, d); stats.unmapped++;
+        // Privacy scan first, while PII key names are still intact (contact.first_name
+        // would otherwise become contact_first_name and slip past the key list).
+        out = buildUnmapped(name, scrub(d, "", 0, counter) || {}); stats.unmapped++;
       } else {
         return;
       }
@@ -637,7 +720,6 @@ if (/[?&]mode=inline/.test(location.search)) {
         else if (FIRST_LOAD_EVENT) { out.event = FIRST_LOAD_EVENT; }
       }
 
-      var counter = { n: 0 };
       out = scrub(clean(out) || {}, "", 0, counter);
       if (counter.n) { stats.pii_redacted += counter.n; health("pii_redacted", name, counter.n + " value(s)"); }
       out.acdl_event = name;                                 // outside aa, for QA only
