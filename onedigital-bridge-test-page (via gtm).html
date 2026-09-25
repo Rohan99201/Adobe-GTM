@@ -29,7 +29,7 @@ window.adobeDataLayer.push({
 if (/[?&]mode=inline/.test(location.search)) {
   window.__bridgeSource = "hardcoded in page";
 /*
- * ACDL -> MSG "aa" bridge  v2.0.0   (One Digital / Markerstudy Group)
+ * ACDL -> MSG "aa" bridge  v3.2.0   (One Digital / Markerstudy Group)
  *
  * Source: window.adobeDataLayer, as specified in the Analytics Blueprint.
  * Target: window.dataLayer, in the exact shape of the MSG Global Analytics
@@ -43,16 +43,33 @@ if (/[?&]mode=inline/.test(location.search)) {
  *                 adobeDataLayer init and BEFORE the GTM snippet.
  * Running both at once is safe: the run-once guard means the first copy wins.
  *
+ * Built to last:
+ *  - Future ACDL events are never lost: unmapped ones reach GTM as aa_<name>,
+ *    with their data flattened into single keys under aa{} (aa.hello, not
+ *    aa.rohantest.hello), so one GTM variable reads each value.
+ *  - New mappings are a few lines in CUSTOM_RULES (or acdlBridge.addRule from
+ *    another tag). The engine below never needs editing.
+ *  - Privacy guard on EVERY push: PII keys dropped; emails, card numbers,
+ *    UK phone numbers and postcodes redacted inside any string, URLs included.
+ *  - Protection: event_id de-duplication, per-second and per-page rate limits,
+ *    size limits, error isolation, and a kill switch.
+ *  - Self-monitoring: problems are pushed as acdl_bridge_health so a GA4 tag
+ *    can report Blueprint drift, PII leaks or errors from production.
+ *  - Live stats in window.__acdlBridge.stats (counts and processing time).
+ *
  * Debug: add ?acdl_debug=1 to any URL to log every translation to the console.
+ * Kill switch: set window.__acdlBridgeOff = true before this runs, or add ?acdl_off=1.
  * ES5 only on purpose, so it runs in any GTM container and any browser.
  */
 (function (w) {
   "use strict";
+  var VERSION = "3.2.0";
   if (w.__acdlBridge) { return; }                 // run-once guard
-  w.__acdlBridge = { version: "2.0.0" };
+  if (w.__acdlBridgeOff === true || /[?&]acdl_off=1/.test(w.location.search)) { return; }  // kill switch
 
   var ADL = w.adobeDataLayer = w.adobeDataLayer || [];
-  var GDL = w.dataLayer = w.dataLayer || [];
+  var DATALAYER_NAME = "dataLayer";               // MSG / GTM data layer name
+  var GDL = w[DATALAYER_NAME] = w[DATALAYER_NAME] || [];
   var DEBUG = /[?&]acdl_debug=1/.test(w.location.search);
 
   /* =====================================================================
@@ -83,10 +100,42 @@ if (/[?&]mode=inline/.test(location.search)) {
   // want a trigger for it during phase 1 testing.
   var FIRST_LOAD_EVENT = "";
 
-  // ACDL events with no MSG equivalent are forwarded as "acdl_<name>" with
-  // the (email-safe) ACDL data under "acdl", so new tags can use them later.
+  // ACDL events with no MSG mapping are forwarded as "aa_<name>" with their
+  // (privacy-scrubbed) data under aa{}, so new tags can use them straight away.
   var FORWARD_UNMAPPED = true;
-  var UNMAPPED_PREFIX = "acdl_";
+  var UNMAPPED_PREFIX = "aa_";
+  var UNMAPPED_CONTAINER = "aa";
+
+  // Event names MSG already owns. If a new ACDL event would land on one of
+  // these (e.g. the Blueprint's newsletter "sign_up" -> "aa_sign_up", which is
+  // MSG's account registration), it is sent as "aa_acdl_<name>" instead, so
+  // existing tags never fire on the wrong thing.
+  var MSG_EVENTS = {
+    spa_page_view: 1, aa_login: 1, aa_login_failed: 1, aa_sign_up: 1, aa_form_submit: 1,
+    aa_lookup: 1, aa_live_chat: 1, aa_begin_checkout: 1, aa_purchase: 1, acdl_bridge_health: 1
+  };
+  var COLLISION_PREFIX = "aa_acdl_";
+
+  // How unknown events are laid out under aa{}.
+  //  "full":      every value is one key.  {rohantest:{hello, nested:{level}}}
+  //               -> aa.hello, aa.nested_level
+  //  "one_level": only the outer wrapper is removed -> aa.hello, aa.nested.level
+  //  "off":       data kept exactly as sent         -> aa.rohantest.hello
+  // Two objects with the same key name (quote.status, payment.status) keep
+  // their wrapper name on that key (quote_status, payment_status).
+  // Lists of objects become one key per field, values joined with "|", plus
+  // a _count key: add_ons [{name:"a"},{name:"b"}] -> add_ons_name "a|b",
+  // add_ons_count 2. This matches MSG's own policy_name "x|y" convention.
+  var UNMAPPED_FLATTEN = "full";
+  var LIST_SEPARATORS = ["|", ",", ";"];   // outer list, list inside a list, deeper
+
+  // Keys MSG owns inside aa{}. A new event carrying one of these (e.g. its own
+  // "user" object) has it renamed to acdl_<key>, so it never mixes with or
+  // replaces MSG values such as aa.user.user_id.
+  var MSG_AA_KEYS = {
+    page: 1, user: 1, ecommerce: 1, purchase_type: 1, form_name: 1, form_result: 1,
+    error_message: 1, lookup_name: 1, lookup_result: 1
+  };
 
   // MSG brand lookup table: ACDL sends lowercase, MSG keeps brand casing.
   var BRANDS = {
@@ -117,6 +166,54 @@ if (/[?&]mode=inline/.test(location.search)) {
   // MSG: quote fields are omitted on non-quote pages. Remembered quote data is
   // only added to page views that carry a quote_engine_step_nr.
   var QUOTE_FIELDS_ONLY_ON_QUOTE_PAGES = true;
+
+  // ---- Future events: declarative rules, no engine code needed ----------
+  // "acdl event name": { event: "gtm event name",
+  //                      fields: { "target.path": "source.path" or [fallbacks] },
+  //                      required: ["target.path", ...] }   // flagged if empty
+  // Source paths are read from the ACDL "data" object. Example, left off:
+  var CUSTOM_RULES = {
+    // quote_saved: {
+    //   event: "aa_quote_saved",
+    //   fields: { "aa.user.quote_reference": "quote_information.quote_reference",
+    //             "aa.page.annual_quote_amount": "quote_information.annual_quote_amount" },
+    //   required: ["aa.user.quote_reference"]
+    // }
+  };
+
+  // ---- Protection ---------------------------------------------------------
+  var LIMITS = {
+    perSecond: 100,        // more than this in one second = runaway loop, extra pushes dropped
+    perPage: 2000,         // hard ceiling per page view lifetime
+    maxString: 500,        // longer strings are cut (GA4 keeps 100 characters anyway)
+    maxArray: 50,          // longer arrays are cut
+    maxDepth: 10,          // deeper nesting is dropped
+    rememberIds: 500,      // how many event_ids are kept for de-duplication
+    slowEventMs: 20,       // a single event slower than this is reported (typical: under 1ms)
+    healthEvents: 5,       // max acdl_bridge_health pushes per page
+    maxFlatKeys: 150,      // max keys an unknown event can add under aa{}
+    maxKeyLength: 60       // longer flattened key names are cut
+  };
+
+  // Keys whose text or number values are always dropped. Boolean values are
+  // kept, so consent flags such as marketing_consent.email: true survive.
+  var PII_KEYS = {
+    email: 1, email_address: 1, phone: 1, phone_number: 1, telephone: 1, mobile: 1, mobile_number: 1,
+    first_name: 1, last_name: 1, surname: 1, full_name: 1, date_of_birth: 1, dob: 1,
+    address: 1, address_line_1: 1, address_line_2: 1, street: 1, postcode: 1, post_code: 1, zip: 1,
+    card_number: 1, pan: 1, cvv: 1, sort_code: 1, account_number: 1, iban: 1,
+    national_insurance: 1, ni_number: 1, licence_number: 1, driving_licence_number: 1,
+    vehicle_registration: 1, registration_number: 1, reg_number: 1, ip_address: 1
+  };
+  // Keys that hold IDs are exempt from the pattern scan, so references such
+  // as POL-1234 or long numeric transaction IDs are never mistaken for PII.
+  var ID_KEY = /(^|_)(id|ids|reference|ref|uuid)$/;
+  var PII_PATTERNS = {
+    email:    /[a-z0-9._%+\-]+(?:@|%40)[a-z0-9.\-]+\.[a-z]{2,}/gi,
+    card:     /\b(?:\d[ \-]?){12,18}\d\b/g,          // only redacted if it passes the Luhn check
+    phone:    /(?:\+44\s?|\b0)(?:\d\s?){9,10}\b/g,  // UK numbers
+    postcode: /\b[a-z]{1,2}\d[a-z\d]?\s*\d[a-z]{2}\b/gi // UK postcodes
+  };
 
   /* =====================================================================
    * HELPERS
@@ -234,7 +331,7 @@ if (/[?&]mode=inline/.test(location.search)) {
   function userId(u) {
     var e = u && u.email_address;
     if (isHash(e)) { return lc(e); }
-    if (e && !warnedEmail) { warnedEmail = true; warn("user.email_address is not a SHA-256 hash, so it was dropped"); }
+    if (e && !warnedEmail) { warnedEmail = true; stats.pii_redacted++; health("pii_redacted", "user.email_address", "not a sha-256 hash, dropped"); }
     return undefined;
   }
   function policies(d) {
@@ -369,58 +466,297 @@ if (/[?&]mode=inline/.test(location.search)) {
   };
 
   /* =====================================================================
-   * ENGINE
+   * ENGINE: no edits needed below this line.
    * ===================================================================== */
 
-  function safeCopy(data) {   // for unmapped events: drop any non-hashed email
-    return JSON.parse(JSON.stringify(data, function (k, v) {
-      return (k === "email_address" && !isHash(v)) ? undefined : v;
-    }));
+  var stats = { received: 0, forwarded: 0, mapped: 0, unmapped: 0, duplicates: 0,
+                rate_limited: 0, pii_redacted: 0, incomplete: 0, errors: 0,
+                total_ms: 0, max_ms: 0 };
+  var healthSent = 0, healthSeen = {}, pendingHealth = [];
+  var seenIds = {}, seenIdList = [];
+  var rateWindow = 0, rateCount = 0, pageCount = 0;
+  var now = (w.performance && w.performance.now) ? function () { return w.performance.now(); } : function () { return +new Date(); };
+
+  function health(issue, name, detail) {
+    var key = issue + "|" + name;
+    if (healthSeen[key] || healthSent >= LIMITS.healthEvents) { return; }   // once per issue, capped
+    healthSeen[key] = true; healthSent++;
+    pendingHealth.push({ event: "acdl_bridge_health", acdl_bridge: { version: VERSION, issue: issue,
+               acdl_event: name, detail: String(detail || "").slice(0, 100) } });
+    warn(issue + " on " + name + (detail ? ": " + detail : ""));
+  }
+
+  function luhn(digits) {
+    var sum = 0, alt = false, i, n;
+    for (i = digits.length - 1; i >= 0; i--) {
+      n = +digits.charAt(i);
+      if (alt) { n *= 2; if (n > 9) { n -= 9; } }
+      sum += n; alt = !alt;
+    }
+    return digits.length >= 13 && sum % 10 === 0;
+  }
+
+  function scrubString(v, counter) {
+    var before = v, k;
+    v = v.replace(PII_PATTERNS.email, "[redacted]");
+    v = v.replace(PII_PATTERNS.card, function (m) { return luhn(m.replace(/\D/g, "")) ? "[redacted]" : m; });
+    v = v.replace(PII_PATTERNS.phone, "[redacted]");
+    v = v.replace(PII_PATTERNS.postcode, "[redacted]");
+    if (v !== before) { counter.n++; }
+    return v.length > LIMITS.maxString ? v.slice(0, LIMITS.maxString) : v;
+  }
+
+  // Privacy and size guard, applied to every outgoing push.
+  function scrub(v, key, depth, counter) {
+    var out, k, c, i;
+    if (depth > LIMITS.maxDepth) { return undefined; }
+    if (typeof v === "function") { return undefined; }
+    if (key && PII_KEYS[key] && (typeof v === "string" || typeof v === "number")) {
+      if (key === "email_address" && isHash(v)) { return v; }
+      counter.n++; return undefined;
+    }
+    if (typeof v === "string") { return ID_KEY.test(key || "") ? v.slice(0, LIMITS.maxString) : scrubString(v, counter); }
+    if (Array.isArray(v)) {
+      out = [];
+      for (i = 0; i < v.length && i < LIMITS.maxArray; i++) {
+        c = scrub(v[i], key, depth + 1, counter);
+        if (c !== undefined) { out.push(c); }
+      }
+      return out;
+    }
+    if (v && typeof v === "object") {
+      out = {};
+      for (k in v) {
+        if (!v.hasOwnProperty(k) || k.indexOf("__") === 0) { continue; }
+        c = scrub(v[k], k, depth + 1, counter);
+        if (c !== undefined) { out[k] = c; }
+      }
+      return out;
+    }
+    return v;
+  }
+
+  function setPath(obj, path, value) {
+    var keys = path.split("."), i;
+    for (i = 0; i < keys.length - 1; i++) {
+      if (typeof obj[keys[i]] !== "object" || obj[keys[i]] === null) { obj[keys[i]] = {}; }
+      obj = obj[keys[i]];
+    }
+    obj[keys[keys.length - 1]] = value;
+  }
+  function readSource(d, src) {
+    if (typeof src === "function") { return src(d, state); }
+    if (Array.isArray(src)) {
+      for (var i = 0; i < src.length; i++) { var v = get(d, src[i]); if (v !== undefined && v !== null && v !== "") { return v; } }
+      return undefined;
+    }
+    return get(d, src);
+  }
+  function declarative(spec) {
+    return function (d) {
+      var out = { event: spec.event }, k;
+      for (k in spec.fields) { if (spec.fields.hasOwnProperty(k)) { setPath(out, k, readSource(d, spec.fields[k])); } }
+      return out;
+    };
+  }
+
+  // Fields that must be present after mapping. Empty = Blueprint drift, reported.
+  var REQUIRED = {
+    page: ["aa.page.page_path", "aa.page.page_location"],
+    form: ["aa.form_name", "aa.form_result"],
+    lookup: ["aa.lookup_name", "aa.lookup_result"],
+    begin_checkout: ["aa.ecommerce.value", "aa.ecommerce.items"],
+    purchase: ["aa.ecommerce.transaction_id", "aa.ecommerce.value", "aa.ecommerce.items"]
+  };
+  function missing(out, paths) {
+    var gone = [], i, v;
+    for (i = 0; paths && i < paths.length; i++) {
+      v = get(out, paths[i]);
+      if (v === undefined || v === null || v === "" || (Array.isArray(v) && !v.length)) { gone.push(paths[i]); }
+    }
+    return gone;
+  }
+
+  // GTM variable paths split on dots, so keys must be plain words.
+  function safeKey(k) { return String(k).replace(/[^A-Za-z0-9_]/g, "_"); }
+  function joinKey(a, b) { return a ? (b ? a + "_" + b : a) : b; }
+
+  // Writes every value of v into out as a single key. level = list depth.
+  function flatInto(out, prefix, v, level, deep) {
+    var k, i, objects = false;
+    if (v === null || v === undefined || typeof v === "function") { return; }
+    if (Array.isArray(v)) {
+      if (!v.length) { return; }
+      for (i = 0; i < v.length; i++) { if (v[i] && typeof v[i] === "object") { objects = true; } }
+      var sep = LIST_SEPARATORS[Math.min(level, LIST_SEPARATORS.length - 1)];
+      if (!objects) { out[prefix] = v.length === 1 ? v[0] : v.join(sep); return; }
+      out[joinKey(prefix, "count")] = v.length;
+      if (v.length === 1) { flatInto(out, prefix, v[0], level, deep); return; }
+      var cols = {}, order = [], one, arr;
+      for (i = 0; i < v.length; i++) {
+        one = {};
+        flatInto(one, "", v[i], level + 1, deep);
+        for (k in one) { if (one.hasOwnProperty(k)) { if (!cols[k]) { cols[k] = []; order.push(k); } cols[k][i] = one[k]; } }
+      }
+      for (var c = 0; c < order.length; c++) {
+        arr = [];
+        for (i = 0; i < v.length; i++) { arr.push(cols[order[c]][i] === undefined ? "" : String(cols[order[c]][i])); }
+        out[joinKey(prefix, order[c])] = arr.join(sep);
+      }
+      return;
+    }
+    if (typeof v === "object") {
+      if (!deep && prefix) { out[prefix] = v; return; }      // "one_level": keep inner objects
+      for (k in v) { if (v.hasOwnProperty(k)) { flatInto(out, joinKey(prefix, safeKey(k)), v[k], level, deep); } }
+      return;
+    }
+    out[prefix] = v;
+  }
+
+  function buildUnmapped(name, d) {
+    var base = name.indexOf("aa_") === 0 ? name.slice(3) : name;    // no aa_aa_ doubling
+    var evt = UNMAPPED_PREFIX + base;
+    if (MSG_EVENTS[evt]) {
+      evt = COLLISION_PREFIX + base;
+      health("name_collision", name, "sent as " + evt);
+    }
+    var box = {}, k, f, m, v, sk;
+
+    if (UNMAPPED_FLATTEN === "off") {
+      for (k in d) {
+        if (!d.hasOwnProperty(k) || k === "event_id") { continue; }
+        box[MSG_AA_KEYS[k] ? "acdl_" + k : safeKey(k)] = d[k];
+      }
+    } else {
+      var deep = UNMAPPED_FLATTEN === "full", entries = [], counts = {}, used = 0;
+      for (k in d) {
+        if (!d.hasOwnProperty(k) || k === "event_id") { continue; }  // event_id already sits at top level
+        v = d[k]; sk = safeKey(k); m = {};
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          // Plain object at the top: drop its wrapper name (rohantest.hello -> hello)
+          for (f in v) { if (v.hasOwnProperty(f)) { flatInto(m, safeKey(f), v[f], 0, deep); } }
+          for (f in m) { if (m.hasOwnProperty(f)) { entries.push({ short: f, full: sk + "_" + f, value: m[f] }); } }
+        } else {
+          // Lists and single values keep their own name (products -> products_name)
+          flatInto(m, sk, v, 0, deep);
+          for (f in m) { if (m.hasOwnProperty(f)) { entries.push({ short: f, full: f, value: m[f] }); } }
+        }
+      }
+      for (f = 0; f < entries.length; f++) { counts[entries[f].short] = (counts[entries[f].short] || 0) + 1; }
+      for (f = 0; f < entries.length; f++) {
+        var e = entries[f];
+        var key = (counts[e.short] > 1 || MSG_AA_KEYS[e.short]) ? e.full : e.short;
+        if (MSG_AA_KEYS[key]) { key = "acdl_" + key; }
+        key = key.slice(0, LIMITS.maxKeyLength);
+        var n = 2, unique = key;
+        while (box.hasOwnProperty(unique)) { unique = key + "_" + (n++); }
+        if (used >= LIMITS.maxFlatKeys) { health("too_many_keys", name, entries.length + " keys, kept " + LIMITS.maxFlatKeys); break; }
+        box[unique] = e.value; used++;
+      }
+    }
+    var out = { event: evt };
+    out[UNMAPPED_CONTAINER] = box;
+    return out;
+  }
+
+  function addRule(acdlName, spec) {
+    if (!acdlName || !spec || !spec.event || !spec.fields) { warn("addRule needs a name, spec.event and spec.fields"); return false; }
+    var id = "custom:" + lc(acdlName);
+    BUILDERS[id] = declarative(spec);
+    REQUIRED[id] = spec.required || [];
+    EVENT_RULES[lc(acdlName)] = id;
+    MSG_EVENTS[spec.event] = 1;          // later unmapped events can't collide with it
+    return true;
+  }
+  for (var r in CUSTOM_RULES) { if (CUSTOM_RULES.hasOwnProperty(r)) { addRule(r, CUSTOM_RULES[r]); } }
+
+  function allowRate() {
+    var t = Math.floor(+new Date() / 1000);
+    if (t !== rateWindow) { rateWindow = t; rateCount = 0; }
+    rateCount++; pageCount++;
+    return rateCount <= LIMITS.perSecond && pageCount <= LIMITS.perPage;
+  }
+  function isDuplicate(id) {
+    if (!id) { return false; }
+    id = String(id);
+    if (seenIds[id]) { return true; }
+    seenIds[id] = true; seenIdList.push(id);
+    if (seenIdList.length > LIMITS.rememberIds) { delete seenIds[seenIdList.shift()]; }
+    return false;
   }
 
   function forward(item) {
+    var t0 = now(), name = "unknown";
     try {
       if (!item || typeof item !== "object" || !(item.event || item.eventName)) { return; }
       if (item.__acdlSent) { return; }                       // never send the same object twice
       try { Object.defineProperty(item, "__acdlSent", { value: true }); } catch (ignore) {}
+      stats.received++;
 
-      var name = lc(item.event || item.eventName);
-      var d = item.data || item.eventInfo || {};
-      var rule = EVENT_RULES[name], out;
+      // Event names become GTM trigger names, so keep them clean and short.
+      name = lc(String(item.event || item.eventName)).replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "unnamed";
+      var d = (item.data && typeof item.data === "object") ? item.data
+            : (item.eventInfo && typeof item.eventInfo === "object") ? item.eventInfo : {};
+
+      if (isDuplicate(d.event_id)) { stats.duplicates++; return; }   // Blueprint: retries reuse event_id
+      if (!allowRate()) { stats.rate_limited++; health("rate_limited", name, LIMITS.perSecond + "/s"); return; }
 
       remember(name, d);
-
+      var rule = EVENT_RULES[name], out, counter = { n: 0 };
       if (rule) {
-        out = BUILDERS[rule](d, name);
+        out = BUILDERS[rule](d, name); stats.mapped++;
       } else if (FORWARD_UNMAPPED) {
-        out = { event: UNMAPPED_PREFIX + name, acdl: safeCopy(d) };
+        // Privacy scan first, while PII key names are still intact (contact.first_name
+        // would otherwise become contact_first_name and slip past the key list).
+        out = buildUnmapped(name, scrub(d, "", 0, counter) || {}); stats.unmapped++;
       } else {
         return;
       }
 
       if (rule === "page") {
         state.pageViews++;
-        var spa = state.pageViews > 1 || /history/.test(lc(d.event_trigger || ""));
-        if (spa) {
-          GDL.push(function () { this.reset(); });           // MSG single page app pattern
-          out.event = "spa_page_view";
-        } else if (FIRST_LOAD_EVENT) {
-          out.event = FIRST_LOAD_EVENT;
-        }
+        var spa = state.pageViews > 1 || /history/.test(lc(String(d.event_trigger || "")));
+        if (spa) { out.event = "spa_page_view"; }
+        else if (FIRST_LOAD_EVENT) { out.event = FIRST_LOAD_EVENT; }
+      }
+
+      out = scrub(clean(out) || {}, "", 0, counter);
+      if (counter.n) { stats.pii_redacted += counter.n; health("pii_redacted", name, counter.n + " value(s)"); }
+      out.acdl_event = name;                                 // outside aa, for QA only
+      if (d.event_id) { out.event_id = String(d.event_id).slice(0, 100); }
+
+      var gone = missing(out, REQUIRED[rule]);
+      if (gone.length) { stats.incomplete++; health("incomplete", name, gone.join(",")); }
+
+      if (rule === "page" && out.event === "spa_page_view") {
+        GDL.push(function () { this.reset(); });             // MSG single page app pattern
       }
       if (rule === "begin_checkout" || rule === "purchase") {
         GDL.push({ aa: { ecommerce: null } });               // MSG: clear the previous ecommerce object
       }
-
-      out = clean(out) || {};
-      out.acdl_event = name;                                 // outside aa, for QA only
-      if (d.event_id) { out.event_id = d.event_id; }
       GDL.push(out);
+      stats.forwarded++;
       if (DEBUG && w.console) { w.console.log("[acdl-bridge]", name, "->", out); }
     } catch (e) {
-      warn("skipped an event: " + e);                        // never break the site's own push
+      stats.errors++;
+      health("error", name, e && e.message);                 // never break the site's own push
+    } finally {
+      var ms = now() - t0;
+      stats.total_ms += ms;
+      if (ms > stats.max_ms) { stats.max_ms = ms; }
+      if (ms > LIMITS.slowEventMs) { health("slow", name, Math.round(ms) + "ms"); }
+      while (pendingHealth.length) { GDL.push(pendingHealth.shift()); }   // after the event, never before
     }
   }
+
+  // Public, read-only-ish API for QA and for adding rules from another tag.
+  w.__acdlBridge = {
+    version: VERSION,
+    stats: stats,
+    addRule: addRule,
+    rules: function () { var o = [], k; for (k in EVENT_RULES) { if (EVENT_RULES.hasOwnProperty(k)) { o.push(k + " -> " + EVENT_RULES[k]); } } return o; }
+  };
+  w.acdlBridge = w.__acdlBridge;
 
   // Wrap whatever push currently exists (native, or the Adobe library's own).
   function wrap() {
@@ -470,6 +806,12 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
   button{background:var(--panel);border:1px solid var(--line);color:var(--ink);padding:.5rem .85rem;border-radius:8px;font-size:.85rem;cursor:pointer}
   button:hover{border-color:var(--ok)} button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
   button small{color:var(--dim)}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:.6rem}
+  .m{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:8px;padding:.6rem .75rem}
+  .m b{display:block;font-size:1.15rem;margin:.15rem 0}
+  .m span{font-size:.72rem;color:var(--dim)}
+  .m.good{border-left-color:var(--ok)} .m.ni{border-left-color:var(--warn)} .m.poor{border-left-color:#ff7b72}
+  #stressOut{font-size:.85rem;color:var(--ink);margin-top:.6rem;min-height:1.2em}
   .panels{display:grid;grid-template-columns:1fr;gap:1rem;margin-top:1rem}
   @media(min-width:860px){.panels{grid-template-columns:1fr 1fr}}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column;height:520px;overflow:hidden}
@@ -488,6 +830,16 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
   </div>
   <h2>Bridge status</h2>
   <span id="status">Checking…</span>
+
+  <h2>Page speed (this page, live)</h2>
+  <div class="metrics" id="vitals"></div>
+  <h2>Bridge and GTM cost</h2>
+  <div class="metrics" id="costs"></div>
+  <div class="btns" style="margin-top:.7rem">
+    <button id="stress">Stress test: 1,000 pushes in one go</button>
+  </div>
+  <div id="stressOut"></div>
+  <p>Core Web Vitals come from the browser's own PerformanceObserver, so they add nothing to the page. INP needs you to click something first, and CLS here is a simple running total. For the real site, confirm with PageSpeed Insights, which also shows field data from real users.</p>
 
   <h2>Quote and purchase journey (click in order)</h2>
   <div class="btns">
@@ -524,6 +876,8 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     <div class="panel"><h3>adobeDataLayer: last push (what the site sends)</h3><pre id="adlLog">Waiting…</pre></div>
     <div class="panel"><h3>dataLayer: last 4 entries (what GTM reads)</h3><pre id="gtmLog">Waiting…</pre></div>
   </div>
+  <h2>Bridge health (window.__acdlBridge.stats)</h2>
+  <div class="panel" style="height:auto"><pre id="healthLog">Waiting…</pre></div>
 </main>
 
 <script>
@@ -605,10 +959,83 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     }
   }
   document.querySelectorAll("button[data-evt]").forEach(function (btn) {
-    btn.addEventListener("click", function () { window.adobeDataLayer.push(samples[btn.dataset.evt]()); setTimeout(refresh, 50); });
+    btn.addEventListener("click", function () { window.adobeDataLayer.push(samples[btn.dataset.evt]()); setTimeout(function () { refresh(); renderSpeed(); }, 50); });
   });
-  refresh();
-  window.addEventListener("load", function () { setTimeout(refresh, 1500); });
+  /* ---------- Page speed: native browser APIs, no library, no network ---------- */
+  var v = { LCP: null, CLS: 0, INP: null, FCP: null, TBT: 0, longTasks: 0 };
+  function observe(type, fn, extra) {
+    try {
+      var opts = { type: type, buffered: true };
+      if (extra) { for (var k in extra) { opts[k] = extra[k]; } }
+      new PerformanceObserver(function (list) { list.getEntries().forEach(fn); }).observe(opts);
+    } catch (e) { /* metric not supported in this browser */ }
+  }
+  observe("largest-contentful-paint", function (e) { v.LCP = e.startTime; });
+  observe("layout-shift", function (e) { if (!e.hadRecentInput) { v.CLS += e.value; } });
+  observe("paint", function (e) { if (e.name === "first-contentful-paint") { v.FCP = e.startTime; } });
+  observe("event", function (e) { if (e.interactionId) { v.INP = Math.max(v.INP || 0, e.duration); } }, { durationThreshold: 16 });
+  observe("longtask", function (e) { v.longTasks++; v.TBT += Math.max(0, e.duration - 50); });
+
+  // Google's thresholds: [good up to, needs improvement up to]
+  var LIMITS = { LCP: [2500, 4000], INP: [200, 500], CLS: [0.1, 0.25], FCP: [1800, 3000], TTFB: [800, 1800], TBT: [200, 600] };
+  function rate(key, val) {
+    if (val === null || val === undefined || !LIMITS[key]) { return ""; }
+    return val <= LIMITS[key][0] ? "good" : val <= LIMITS[key][1] ? "ni" : "poor";
+  }
+  function ms(x) { return (x === null || x === undefined) ? "n/a" : (x >= 1000 ? (x / 1000).toFixed(2) + " s" : Math.round(x) + " ms"); }
+  function card(host, label, value, note, cls) {
+    var d = document.createElement("div"); d.className = "m " + (cls || "");
+    var s1 = document.createElement("span"); s1.textContent = label;
+    var b = document.createElement("b"); b.textContent = value;
+    var s2 = document.createElement("span"); s2.textContent = note || "";
+    d.appendChild(s1); d.appendChild(b); d.appendChild(s2); host.appendChild(d);
+  }
+  var vitalsEl = document.getElementById("vitals"), costsEl = document.getElementById("costs");
+  function renderSpeed() {
+    var nav = (performance.getEntriesByType && performance.getEntriesByType("navigation")[0]) || {};
+    var ttfb = nav.responseStart || null;
+    vitalsEl.textContent = "";
+    card(vitalsEl, "LCP, largest paint", ms(v.LCP), "good under 2.5 s", rate("LCP", v.LCP));
+    card(vitalsEl, "INP, response to clicks", v.INP === null ? "click to measure" : ms(v.INP), "good under 200 ms", rate("INP", v.INP));
+    card(vitalsEl, "CLS, layout shift", v.CLS.toFixed(3), "good under 0.1", rate("CLS", v.CLS));
+    card(vitalsEl, "FCP, first paint", ms(v.FCP), "good under 1.8 s", rate("FCP", v.FCP));
+    card(vitalsEl, "TTFB, server response", ms(ttfb), "good under 800 ms", rate("TTFB", ttfb));
+    card(vitalsEl, "TBT, blocked main thread", ms(v.TBT), v.longTasks + " long task(s)", rate("TBT", v.TBT));
+
+    var st = window.__acdlBridge && window.__acdlBridge.stats;
+    var gtm = (performance.getEntriesByType ? performance.getEntriesByType("resource") : []).filter(function (r) { return /gtm\.js/.test(r.name); })[0];
+    costsEl.textContent = "";
+    if (st) {
+      var avg = st.received ? st.total_ms / st.received : 0;
+      card(costsEl, "Bridge: total time on page", st.total_ms.toFixed(2) + " ms", st.received + " event(s) processed", st.total_ms < 50 ? "good" : "ni");
+      card(costsEl, "Bridge: average per event", avg.toFixed(3) + " ms", "max " + st.max_ms.toFixed(2) + " ms", avg < 1 ? "good" : "ni");
+      card(costsEl, "Bridge: network requests", "0", "inline, no downloads", "good");
+    } else {
+      card(costsEl, "Bridge", "not running", "check the GTM tag", "poor");
+    }
+    if (gtm) {
+      card(costsEl, "GTM container download", ms(gtm.duration), gtm.transferSize ? Math.round(gtm.transferSize / 1024) + " KB transferred" : "size hidden (cache or CORS)", rate("FCP", gtm.duration));
+    } else {
+      card(costsEl, "GTM container download", "not loaded yet", "or blocked by an ad blocker", "ni");
+    }
+    card(costsEl, "Page fully loaded", ms(nav.loadEventEnd || null), "DOM ready " + ms(nav.domContentLoadedEventEnd || null), "");
+    document.getElementById("healthLog").textContent = st ? JSON.stringify(st, function (k, x) { return typeof x === "number" ? Math.round(x * 1000) / 1000 : x; }, 2) : "Bridge not running";
+  }
+
+  document.getElementById("stress").addEventListener("click", function () {
+    if (!window.__acdlBridge) { document.getElementById("stressOut").textContent = "Bridge not running."; return; }
+    var st = window.__acdlBridge.stats, f0 = st.forwarded, r0 = st.rate_limited, t0 = performance.now(), i, stamp = Date.now();
+    for (i = 0; i < 1000; i++) { window.adobeDataLayer.push({ event: "stress_test", data: { event_id: "st-" + stamp + "-" + i, n: i } }); }
+    var took = performance.now() - t0;
+    document.getElementById("stressOut").textContent = "1,000 pushes took " + took.toFixed(1) + " ms in total (" + (took / 1000).toFixed(3) +
+      " ms each, including GTM's own processing). The bridge forwarded " + (st.forwarded - f0) + " and blocked " + (st.rate_limited - r0) +
+      " as a runaway loop, which is the protection working.";
+    refresh(); renderSpeed();
+  });
+
+  refresh(); renderSpeed();
+  setInterval(renderSpeed, 2000);
+  window.addEventListener("load", function () { setTimeout(function () { refresh(); renderSpeed(); }, 1500); });
 })();
 </script>
 </body>
