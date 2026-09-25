@@ -29,7 +29,7 @@ window.adobeDataLayer.push({
 if (/[?&]mode=inline/.test(location.search)) {
   window.__bridgeSource = "hardcoded in page";
 /*
- * ACDL -> MSG "aa" bridge  v3.0.0   (One Digital / Markerstudy Group)
+ * ACDL -> MSG "aa" bridge  v3.1.0   (One Digital / Markerstudy Group)
  *
  * Source: window.adobeDataLayer, as specified in the Analytics Blueprint.
  * Target: window.dataLayer, in the exact shape of the MSG Global Analytics
@@ -44,7 +44,8 @@ if (/[?&]mode=inline/.test(location.search)) {
  * Running both at once is safe: the run-once guard means the first copy wins.
  *
  * Built to last:
- *  - Future ACDL events are never lost: unmapped ones reach GTM as acdl_<name>.
+ *  - Future ACDL events are never lost: unmapped ones reach GTM as aa_<name>,
+ *    with their data under aa{}, following the MSG naming convention.
  *  - New mappings are a few lines in CUSTOM_RULES (or acdlBridge.addRule from
  *    another tag). The engine below never needs editing.
  *  - Privacy guard on EVERY push: PII keys dropped; emails, card numbers,
@@ -61,7 +62,7 @@ if (/[?&]mode=inline/.test(location.search)) {
  */
 (function (w) {
   "use strict";
-  var VERSION = "3.0.0";
+  var VERSION = "3.1.0";
   if (w.__acdlBridge) { return; }                 // run-once guard
   if (w.__acdlBridgeOff === true || /[?&]acdl_off=1/.test(w.location.search)) { return; }  // kill switch
 
@@ -98,10 +99,29 @@ if (/[?&]mode=inline/.test(location.search)) {
   // want a trigger for it during phase 1 testing.
   var FIRST_LOAD_EVENT = "";
 
-  // ACDL events with no MSG equivalent are forwarded as "acdl_<name>" with
-  // the (email-safe) ACDL data under "acdl", so new tags can use them later.
+  // ACDL events with no MSG mapping are forwarded as "aa_<name>" with their
+  // (privacy-scrubbed) data under aa{}, so new tags can use them straight away.
   var FORWARD_UNMAPPED = true;
-  var UNMAPPED_PREFIX = "acdl_";
+  var UNMAPPED_PREFIX = "aa_";
+  var UNMAPPED_CONTAINER = "aa";
+
+  // Event names MSG already owns. If a new ACDL event would land on one of
+  // these (e.g. the Blueprint's newsletter "sign_up" -> "aa_sign_up", which is
+  // MSG's account registration), it is sent as "aa_acdl_<name>" instead, so
+  // existing tags never fire on the wrong thing.
+  var MSG_EVENTS = {
+    spa_page_view: 1, aa_login: 1, aa_login_failed: 1, aa_sign_up: 1, aa_form_submit: 1,
+    aa_lookup: 1, aa_live_chat: 1, aa_begin_checkout: 1, aa_purchase: 1, acdl_bridge_health: 1
+  };
+  var COLLISION_PREFIX = "aa_acdl_";
+
+  // Keys MSG owns inside aa{}. A new event carrying one of these (e.g. its own
+  // "user" object) has it renamed to acdl_<key>, so it never mixes with or
+  // replaces MSG values such as aa.user.user_id.
+  var MSG_AA_KEYS = {
+    page: 1, user: 1, ecommerce: 1, purchase_type: 1, form_name: 1, form_result: 1,
+    error_message: 1, lookup_name: 1, lookup_result: 1
+  };
 
   // MSG brand lookup table: ACDL sends lowercase, MSG keeps brand casing.
   var BRANDS = {
@@ -541,12 +561,30 @@ if (/[?&]mode=inline/.test(location.search)) {
     return gone;
   }
 
+  function buildUnmapped(name, d) {
+    var base = name.indexOf("aa_") === 0 ? name.slice(3) : name;    // no aa_aa_ doubling
+    var evt = UNMAPPED_PREFIX + base;
+    if (MSG_EVENTS[evt]) {
+      evt = COLLISION_PREFIX + base;
+      health("name_collision", name, "sent as " + evt);
+    }
+    var box = {}, k;
+    for (k in d) {
+      if (!d.hasOwnProperty(k) || k === "event_id") { continue; }      // event_id already sits at top level
+      box[MSG_AA_KEYS[k] ? "acdl_" + k : k] = d[k];
+    }
+    var out = { event: evt };
+    out[UNMAPPED_CONTAINER] = box;
+    return out;
+  }
+
   function addRule(acdlName, spec) {
     if (!acdlName || !spec || !spec.event || !spec.fields) { warn("addRule needs a name, spec.event and spec.fields"); return false; }
     var id = "custom:" + lc(acdlName);
     BUILDERS[id] = declarative(spec);
     REQUIRED[id] = spec.required || [];
     EVENT_RULES[lc(acdlName)] = id;
+    MSG_EVENTS[spec.event] = 1;          // later unmapped events can't collide with it
     return true;
   }
   for (var r in CUSTOM_RULES) { if (CUSTOM_RULES.hasOwnProperty(r)) { addRule(r, CUSTOM_RULES[r]); } }
@@ -587,7 +625,7 @@ if (/[?&]mode=inline/.test(location.search)) {
       if (rule) {
         out = BUILDERS[rule](d, name); stats.mapped++;
       } else if (FORWARD_UNMAPPED) {
-        out = { event: UNMAPPED_PREFIX + name, acdl: d }; stats.unmapped++;
+        out = buildUnmapped(name, d); stats.unmapped++;
       } else {
         return;
       }
