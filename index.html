@@ -34,7 +34,7 @@ if (/[?&]mode=inline/.test(location.search)) {
  * working unchanged.
  *
  * Deploy phase 1: GTM Custom HTML tag, trigger "Initialization - All Pages",
- *                 fire once per page, "Support document.write" OFF.
+ *                 fire once per page, leave the tag's advanced settings at default.
  * Deploy phase 2: paste this exact block into <head>, after the
  *                 adobeDataLayer init and BEFORE the GTM snippet.
  * Running both at once is safe: the run-once guard means the first copy wins.
